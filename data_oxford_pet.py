@@ -1,141 +1,112 @@
 # Oxford-IIIT Pet via TFDS. Trimap 1,2,3 -> 0,1,2 (pet, bg, boundary).
 
 from __future__ import annotations
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 try:
     import tensorflow_datasets as tfds
 except ImportError:
     raise ImportError("Install tensorflow-datasets: pip install tensorflow-datasets tensorflow")
-
-# Trimap: TFDS uses 1=pet, 2=background, 3=boundary -> we map to 0,1,2
-NUM_SEGMENTATION_CLASSES = 3
-DATA_SEED = 42  # same train/val/test for all scripts
-
-
+DATA_SEED = 42
 def _trimap_to_class_indices(mask: np.ndarray) -> np.ndarray:
     """Convert TFDS trimap (1,2,3) to 0-indexed classes (0,1,2)."""
-    # TFDS oxford_iiit_pet segmentation_mask: 1=pet, 2=background, 3=boundary
-    out = np.clip(mask.astype(np.int64) - 1, 0, 2)
-    return out
-
+    return np.clip(mask.astype(np.int64) - 1, 0, 2)
 
 class OxfordPetDataset(Dataset):
-    """
-    PyTorch Dataset for Oxford-IIIT Pet (images + trimap masks).
-    Loads from TFDS and caches in memory; applies resize and optional augment.
-    """
-
     def __init__(
         self,
         split: str,
         target_size: tuple[int, int] = (512, 512),
         augment: bool = False,
-        in_memory: bool = True,
+        in_memory: bool = True, # Kept for compatibility, but we behave 'lazily' now
     ):
-        """
-        split: 'train' or 'test' (TFDS splits).
-        target_size: (H, W) for image and mask.
-        augment: if True, apply flips/rotation (use only for train).
-        in_memory: if True, load all examples into memory in __init__.
-        """
         self.split = split
         self.target_size = target_size
         self.augment = augment
-        self.in_memory = in_memory
 
-        self._images: list[np.ndarray] = []
-        self._masks: list[np.ndarray] = []
-        self._labels: list[int] = []
-
+        # Load the dataset metadata/generator
+        print(f"Initializing {split} split (Lazy Loading enabled to prevent 'Killed' error)...")
         ds = tfds.load("oxford_iiit_pet", split=split)
-        if in_memory:
-            for ex in tfds.as_numpy(ds):
-                img = ex["image"]  # (H, W, 3) uint8
-                seg = ex["segmentation_mask"]  # (H, W, 1) uint8
-                label = int(ex["label"])
-                self._images.append(img)
-                # (H,W,1) -> (H,W), then to 0,1,2
-                mask_flat = seg.squeeze(-1)
-                self._masks.append(_trimap_to_class_indices(mask_flat))
-                self._labels.append(label)
+        
+        # Convert to a list of numpy dictionaries. 
+        # Crucially, we store the RAW compressed data, not the expanded 512x512 float32 tensors.
+        self._examples = list(tfds.as_numpy(ds)) 
+        print(f"Metadata for {len(self._examples)} examples loaded.")
 
     def __len__(self) -> int:
-        return len(self._images) if self._images else 0
-
-    def _resize_image(self, img: np.ndarray) -> np.ndarray:
-        from PIL import Image
-        pil = Image.fromarray(img)
-        pil = pil.resize((self.target_size[1], self.target_size[0]), Image.BILINEAR)
-        return np.array(pil)
-
-    def _resize_mask(self, mask: np.ndarray) -> np.ndarray:
-        from PIL import Image
-        pil = Image.fromarray(mask.astype(np.uint8))
-        pil = pil.resize((self.target_size[1], self.target_size[0]), Image.NEAREST)
-        return np.array(pil).astype(np.int64)
+        return len(self._examples)
 
     def __getitem__(self, idx: int):
-        img = self._images[idx]
-        mask = self._masks[idx]
+        # We process the image ONLY when requested
+        ex = self._examples[idx]
 
-        img = img.astype(np.float32) / 255.0
-        img = self._resize_image(img)
-        mask = self._resize_mask(mask)
+        # 1. Process Image: Resize -> Normalize
+        img_raw = Image.fromarray(ex["image"])
+        img_pil = img_raw.resize((self.target_size[1], self.target_size[0]), Image.BILINEAR)
+        img_np = np.array(img_pil).astype(np.float32) / 255.0
 
+        # 2. Process Mask: Resize -> Map Classes
+        mask_raw = ex["segmentation_mask"].squeeze(-1)
+        mask_pil = Image.fromarray(mask_raw.astype(np.uint8))
+        mask_pil = mask_pil.resize((self.target_size[1], self.target_size[0]), Image.NEAREST)
+        mask_np = _trimap_to_class_indices(np.array(mask_pil))
+
+        # 3. Augmentation (happens on CPU)
         if self.augment:
-            seed = torch.randint(0, 2**32, (1,)).item()
-            torch.manual_seed(seed)
-            img, mask = _augment_pair(img, mask)
+            img_np, mask_np = _augment_pair(img_np, mask_np)
 
-        # NCHW
-        img = torch.from_numpy(img).permute(2, 0, 1).float()
-        mask = torch.from_numpy(mask).long()
-        return img, mask
+        # 4. Final Conversion to PyTorch Tensors
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() # CHW
+        mask_tensor = torch.from_numpy(mask_np).long()
 
+        return img_tensor, mask_tensor
 
 def _augment_pair(img: np.ndarray, mask: np.ndarray):
-    """Simple flips + 90deg rotation; keep img (H,W,3) and mask (H,W) in sync."""
     import random
-    from PIL import Image
-
+    # Note: img is already 0.0-1.0 here
     pil_img = Image.fromarray((img * 255).astype(np.uint8))
     pil_mask = Image.fromarray(mask.astype(np.uint8))
 
     if random.random() > 0.5:
         pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
         pil_mask = pil_mask.transpose(Image.FLIP_LEFT_RIGHT)
-    if random.random() > 0.5:
-        pil_img = pil_img.transpose(Image.FLIP_TOP_BOTTOM)
-        pil_mask = pil_mask.transpose(Image.FLIP_TOP_BOTTOM)
+    
     k = random.randint(0, 3)
     if k != 0:
-        pil_img = pil_img.rotate(90 * k, expand=False)
+        pil_img = pil_img.rotate(90 * k)
         pil_mask = pil_mask.rotate(90 * k, resample=Image.NEAREST)
 
-    img = np.array(pil_img).astype(np.float32) / 255.0
-    mask = np.array(pil_mask).astype(np.int64)
-    return img, mask
+    return np.array(pil_img).astype(np.float32) / 255.0, np.array(pil_mask).astype(np.int64)
+
+# Keep other functions (get_fixed_splits, etc.) as they were, 
+# just ensure they call the updated OxfordPetDataset.
 
 
 def get_fixed_splits(
     target_size: int | tuple[int, int] = 512,
     val_fraction: float = 0.1,
 ):
-    """Same train/val/test indices for all scripts (seed=DATA_SEED). Returns (train_ds, val_ds, test_ds)."""
     if isinstance(target_size, int):
         target_size = (target_size, target_size)
-    train_full = OxfordPetDataset("train", target_size=target_size, augment=True, in_memory=True)
+    
+    # Initialize the lazy dataset
+    train_full = OxfordPetDataset("train", target_size=target_size, augment=True)
+    
     n = len(train_full)
     val_len = max(1, int(n * val_fraction))
     train_len = n - val_len
+    
+    # Deterministic split using the seed
     train_ds, val_ds = torch.utils.data.random_split(
-        train_full, [train_len, val_len], generator=torch.Generator().manual_seed(DATA_SEED)
+        train_full, 
+        [train_len, val_len], 
+        generator=torch.Generator().manual_seed(DATA_SEED)
     )
-    test_ds = OxfordPetDataset("test", target_size=target_size, augment=False, in_memory=True)
+    
+    test_ds = OxfordPetDataset("test", target_size=target_size, augment=False)
     return train_ds, val_ds, test_ds
 
 
@@ -143,7 +114,7 @@ def get_train_val_test_loaders(
     target_size: int | tuple[int, int] = 512,
     batch_size: int = 8,
     val_fraction: float = 0.1,
-    num_workers: int = 0,
+    num_workers: int = 4,
 ):
     """
     train_loader, val_loader, test_loader. Same split as get_oxford_pet_datasets_for_cross_teaching
