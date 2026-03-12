@@ -1,210 +1,249 @@
-import os
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
+import json
 import os
 
-# External library for segmentation models (install with: pip install segmentation-models-pytorch)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
 try:
     import segmentation_models_pytorch as smp
 except ImportError:
-    print("Warning: 'segmentation_models_pytorch' not found. Please install it with 'pip install segmentation-models-pytorch'.")
-    exit()
+    print("Please install segmentation-models-pytorch first.")
+    raise
 
-# --- 1. Configuration ---
+from data_oxford_pet import (
+    DEFAULT_LABELED_FRACTION,
+    DEFAULT_VAL_FRACTION,
+    NUM_CLASSES,
+    get_train_val_test_loaders,
+    set_seed,
+)
+
+
 class Config:
-    """Config for U-Net (Oxford-IIIT Pet trimap: 3 classes)."""
-    image_height = 512
-    image_width = 512
-    num_classes = 3   # trimap: 0=pet, 1=background, 2=boundary
+    image_size = 512
     batch_size = 4
-    epochs = 5
-    validation_split = 0.2
-    test_split = 0.1
+    epochs = 8
     learning_rate = 1e-4
-    encoder_name = "resnet34"
-    weights = "imagenet"
+    val_fraction = DEFAULT_VAL_FRACTION
+    labeled_fraction = DEFAULT_LABELED_FRACTION
+    freeze_encoder = True
+    num_workers = 0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 config = Config()
-CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINTS_DIR = os.path.join(ROOT_DIR, "checkpoints")
 MODEL_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "unet_oxford_pet.pth")
+METRICS_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "unet_metrics.json")
 
-print(f"Using device: {config.device}")
 
-# --- 2. Loss & metrics ---
-def dice_loss(y_pred, y_true, smooth=1e-6):
-    """Macro Dice loss (all 3 classes)."""
-    if y_true.dim() == 3:
-        y_true_one_hot = torch.nn.functional.one_hot(y_true, num_classes=config.num_classes)
-        y_true_one_hot = y_true_one_hot.permute(0, 3, 1, 2).float()
-    else:
-        y_true_one_hot = y_true
-    y_pred_soft = torch.nn.functional.softmax(y_pred, dim=1)
-    dice_per_class = []
-    for c in range(config.num_classes):
-        pred_c = y_pred_soft[:, c, ...].contiguous().view(-1)
-        true_c = y_true_one_hot[:, c, ...].contiguous().view(-1)
-        inter = (pred_c * true_c).sum()
-        total = pred_c.sum() + true_c.sum()
-        dice_per_class.append((2.0 * inter + smooth) / (total + smooth))
-    macro_dice = torch.stack(dice_per_class).mean()
-    return 1.0 - macro_dice
-
-def dice_coeff(y_pred, y_true, smooth=1e-6):
-    """Macro Dice (3-class)."""
-    if y_true.dim() == 3:
-        y_true_one_hot = torch.nn.functional.one_hot(y_true, num_classes=config.num_classes)
-        y_true_one_hot = y_true_one_hot.permute(0, 3, 1, 2).float()
-    else:
-        y_true_one_hot = y_true
-    pred_labels = y_pred.argmax(dim=1)
-    dice_per_class = []
-    for c in range(config.num_classes):
-        pred_c = (pred_labels == c).float().view(-1)
-        true_c = y_true_one_hot[:, c, ...].contiguous().view(-1)
-        inter = (pred_c * true_c).sum()
-        total = pred_c.sum() + true_c.sum()
-        dice_per_class.append((2.0 * inter + smooth) / (total + smooth))
-    return torch.stack(dice_per_class).mean().item()
-
-# --- 3. U-Net (frozen encoder, train decoder) ---
 def create_unet_tl():
-    """U-Net with pretrained ResNet; encoder frozen, decoder trained."""
+    # use pretrained resnet encoder for transfer learning
     model = smp.Unet(
-        encoder_name=config.encoder_name,
-        encoder_weights=config.weights,
-        in_channels=3,   # RGB for Oxford Pet
-        classes=config.num_classes,
-        activation="softmax",
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=NUM_CLASSES,
+        activation=None,
     )
-    print(f"Frozen encoder: {config.encoder_name} from {config.weights}.")
-    
-    # FREEZE ENCODER WEIGHTS (Transfer Learning)
-    # This prevents the pre-trained weights from changing during training,
-    # focusing learning on the decoder/segmentation head.
-    for param in model.encoder.parameters():
-        param.requires_grad = False
+
+    if config.freeze_encoder:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
 
     return model
 
-# --- 4. Data (Oxford-IIIT Pet via TFDS) ---
 
-def get_dataset():
-    """Load Oxford-IIIT Pet train/val/test via data_oxford_pet."""
-    from data_oxford_pet import get_train_val_test_loaders
-    train_loader, val_loader, test_loader = get_train_val_test_loaders(
-        target_size=config.image_height,
-        batch_size=config.batch_size,
-        val_fraction=config.validation_split,
-        num_workers=0,
-    )
-    datasets = (train_loader.dataset, val_loader.dataset, test_loader.dataset)
-    print("Oxford-IIIT Pet loaded (train/val/test). Trimap: 3 classes.")
-    return train_loader, val_loader, test_loader, datasets
+class CombinedSegmentationLoss(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ce = nn.CrossEntropyLoss()
 
-# --- 5. Training and Evaluation Loops ---
+    def forward(self, logits, target):
+        ce_loss = self.ce(logits, target)
 
-def train_epoch(model, dataloader, criterion, optimizer):
-    """One training epoch."""
+        probs = torch.softmax(logits, dim=1)
+        target_one_hot = F.one_hot(target, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+
+        dims = (0, 2, 3)
+        intersection = (probs * target_one_hot).sum(dim=dims)
+        denominator = probs.sum(dim=dims) + target_one_hot.sum(dim=dims)
+
+        dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
+        dice_loss = 1.0 - dice.mean()
+
+        return ce_loss + dice_loss
+
+
+@torch.no_grad()
+def compute_metrics(logits, target, num_classes):
+    pred = logits.argmax(dim=1)
+
+    pixel_acc = (pred == target).float().mean().item()
+
+    dice_scores = []
+    iou_scores = []
+
+    for cls in range(num_classes):
+        pred_cls = (pred == cls).float()
+        target_cls = (target == cls).float()
+
+        inter = (pred_cls * target_cls).sum().item()
+        pred_sum = pred_cls.sum().item()
+        target_sum = target_cls.sum().item()
+        union = pred_sum + target_sum - inter
+
+        dice = (2.0 * inter + 1e-6) / (pred_sum + target_sum + 1e-6)
+        iou = (inter + 1e-6) / (union + 1e-6)
+
+        dice_scores.append(dice)
+        iou_scores.append(iou)
+
+    return {
+        "dice": float(sum(dice_scores) / len(dice_scores)),
+        "iou": float(sum(iou_scores) / len(iou_scores)),
+        "pixel_accuracy": float(pixel_acc),
+    }
+
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
-    total_loss = 0
-    total_dice = 0
-    
-    for inputs, targets in dataloader:
-        inputs, targets = inputs.to(config.device), targets.to(config.device)
-        
+
+    total_loss = 0.0
+    total_batches = 0
+
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        logits = model(images)
+        loss = criterion(logits, masks)
         loss.backward()
         optimizer.step()
-        
+
         total_loss += loss.item()
-        total_dice += dice_coeff(outputs, targets)
+        total_batches += 1
 
-    avg_loss = total_loss / len(dataloader)
-    avg_dice = total_dice / len(dataloader)
-    return avg_loss, avg_dice
+    return total_loss / max(total_batches, 1)
 
-def evaluate_model(model, dataloader, criterion):
-    """Eval on val/test."""
+
+@torch.no_grad()
+def evaluate_model(model, dataloader, criterion, device):
     model.eval()
-    total_loss = 0
-    total_dice = 0
-    
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs, targets = inputs.to(config.device), targets.to(config.device)
-            outputs = model(inputs)
-            
-            loss = criterion(outputs, targets)
-            total_loss += loss.item()
-            total_dice += dice_coeff(outputs, targets)
 
-    avg_loss = total_loss / len(dataloader)
-    avg_dice = total_dice / len(dataloader)
-    return avg_loss, avg_dice
+    total_loss = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    total_acc = 0.0
+    total_batches = 0
 
-# --- 6. Main Execution ---
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        logits = model(images)
+        loss = criterion(logits, masks)
+        metrics = compute_metrics(logits, masks, NUM_CLASSES)
+
+        total_loss += loss.item()
+        total_dice += metrics["dice"]
+        total_iou += metrics["iou"]
+        total_acc += metrics["pixel_accuracy"]
+        total_batches += 1
+
+    return {
+        "loss": total_loss / max(total_batches, 1),
+        "dice": total_dice / max(total_batches, 1),
+        "iou": total_iou / max(total_batches, 1),
+        "pixel_accuracy": total_acc / max(total_batches, 1),
+    }
+
+
+def save_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
 
 def main():
-    """Load data, train U-Net (Oxford Pet trimap), save checkpoint."""
-    print("--- U-Net Oxford-IIIT Pet trimap segmentation (transfer learning) ---")
-    train_loader, val_loader, test_loader, datasets = get_dataset()
-    
-    # Create model and set up transfer learning
-    model = create_unet_tl()
-    model.to(config.device)
-    
-    # Define Loss, Optimizer, and Metrics
-    criterion = dice_loss # Use the custom Dice Loss
-    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
-
-    # Print trainable parameters (should mainly be the decoder)
-    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    num_total_params = sum(p.numel() for p in model.parameters())
-    print(f"\n🧠 Model Parameters: {num_total_params:,}")
-    print(f"✨ Trainable Parameters (Decoder/Head only): {num_trainable_params:,} ({(num_trainable_params/num_total_params)*100:.2f}%)")
-
-
-    # Training Loop
-    print(f"\n🚀 Starting training for {config.epochs} epochs...")
-    for epoch in range(config.epochs):
-        train_loss, train_dice = train_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_dice = evaluate_model(model, val_loader, criterion)
-        
-        print(f"Epoch {epoch+1}/{config.epochs} | "
-              f"Train Loss: {train_loss:.4f} | Train Dice: {train_dice:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Dice: {val_dice:.4f}")
-              
-    print("✅ Training complete.")
-
-    # Evaluation
-    print("\n📊 Evaluating model on Test Set...")
-    test_loss, test_dice = evaluate_model(model, test_loader, criterion)
-
-    print(f"\n--- Test Results ---")
-    print(f"  - Test Loss (Dice Loss): {test_loss:.4f}")
-    print(f"  - Test Dice Coeff (F1-score): {test_dice:.4f}")
-
-    # Model Saving
-    print("\n💾 Saving model checkpoint...")
-    # 1. Ensure the target directory exists
+    set_seed()
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-    # 2. Save the model's state dictionary
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"🎉 PyTorch Model state dictionary successfully saved to: {MODEL_SAVE_PATH}")
 
-    print("\n--- Script Finished ---")
+    train_loader, val_loader, test_loader = get_train_val_test_loaders(
+        target_size=config.image_size,
+        batch_size=config.batch_size,
+        val_fraction=config.val_fraction,
+        num_workers=config.num_workers,
+        labeled_fraction=config.labeled_fraction,
+    )
+
+    model = create_unet_tl().to(config.device)
+    criterion = CombinedSegmentationLoss(num_classes=NUM_CLASSES)
+
+    optimizer = optim.Adam(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=config.learning_rate,
+    )
+
+    best_val_dice = -1.0
+    history = []
+
+    for epoch in range(config.epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, config.device)
+        val_metrics = evaluate_model(model, val_loader, criterion, config.device)
+
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_metrics["loss"],
+            "val_dice": val_metrics["dice"],
+            "val_iou": val_metrics["iou"],
+            "val_pixel_accuracy": val_metrics["pixel_accuracy"],
+        }
+        history.append(row)
+
+        print(
+            f"[U-Net] epoch {epoch + 1}/{config.epochs} "
+            f"train_loss={train_loss:.4f} "
+            f"val_dice={val_metrics['dice']:.4f} "
+            f"val_iou={val_metrics['iou']:.4f}"
+        )
+
+        if val_metrics["dice"] > best_val_dice:
+            best_val_dice = val_metrics["dice"]
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "best_val_dice": best_val_dice,
+                },
+                MODEL_SAVE_PATH,
+            )
+
+    checkpoint = torch.load(MODEL_SAVE_PATH, map_location=config.device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    test_metrics = evaluate_model(model, test_loader, criterion, config.device)
+
+    save_json(
+        METRICS_SAVE_PATH,
+        {
+            "model": "U-Net",
+            "setting": "supervised baseline",
+            "labeled_fraction": config.labeled_fraction,
+            "best_val_dice": best_val_dice,
+            "history": history,
+            "test_metrics": test_metrics,
+        },
+    )
+
+    print(f"Saved best model to {MODEL_SAVE_PATH}")
+    print(f"Saved metrics to {METRICS_SAVE_PATH}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"An error occurred during execution: {e}")
-        print("Please ensure you have all required libraries installed, especially 'segmentation-models-pytorch'.")
+    main()

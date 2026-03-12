@@ -1,31 +1,94 @@
+import json
 import os
-import logging
-from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import transforms
+import torch.optim as optim
 import timm
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    import segmentation_models_pytorch as smp
+except ImportError:
+    print("Please install segmentation-models-pytorch first.")
+    raise
+
+from data_oxford_pet import (
+    DEFAULT_VAL_FRACTION,
+    NUM_CLASSES,
+    get_oxford_pet_datasets_for_cross_teaching,
+    set_seed,
+)
 
 
-# --- ViT seg head ---
-class ViTSegmentationHead(nn.Module):
-    """Decoder on ViT features."""
-    def __init__(self, embed_dim=768, num_classes=3, img_size=224, patch_size=16):
+class Config:
+    unet_image_size = 512
+    vit_image_size = 224
+    batch_size = 4
+    epochs = 8
+    learning_rate = 1e-4
+    val_fraction = DEFAULT_VAL_FRACTION
+    unlabeled_fraction = 0.8
+    confidence_threshold = 0.75
+    consistency_weight = 0.5
+    freeze_unet_encoder = True
+    freeze_vit_backbone = True
+    num_workers = 0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+config = Config()
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINTS_DIR = os.path.join(ROOT_DIR, "checkpoints")
+UNET_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "unet_cross_teaching_best.pth")
+VIT_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "vit_cross_teaching_best.pth")
+METRICS_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "cross_teaching_metrics.json")
+
+
+def save_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+class CombinedSegmentationLoss(nn.Module):
+    def __init__(self, num_classes):
         super().__init__()
-        self.num_patches = (img_size // patch_size) ** 2
-        self.patch_size = patch_size
-        self.img_size = img_size
+        self.num_classes = num_classes
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, logits, target):
+        ce_loss = self.ce(logits, target)
+
+        probs = torch.softmax(logits, dim=1)
+        target_one_hot = F.one_hot(target, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+
+        dims = (0, 2, 3)
+        intersection = (probs * target_one_hot).sum(dim=dims)
+        denominator = probs.sum(dim=dims) + target_one_hot.sum(dim=dims)
+
+        dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
+        dice_loss = 1.0 - dice.mean()
+
+        return ce_loss + dice_loss
+
+
+class MaskedCrossEntropyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(reduction="none")
+
+    def forward(self, logits, pseudo_labels, valid_mask):
+        # only train on pseudo labels that pass the confidence threshold
+        per_pixel_loss = self.ce(logits, pseudo_labels)
+        masked_loss = per_pixel_loss * valid_mask
+        denom = valid_mask.sum().clamp_min(1.0)
+        return masked_loss.sum() / denom
+
+
+class ViTSegmentationHead(nn.Module):
+    def __init__(self, embed_dim=768, num_classes=3):
+        super().__init__()
 
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(embed_dim, 512, kernel_size=2, stride=2),
@@ -44,417 +107,466 @@ class ViTSegmentationHead(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(64, num_classes, kernel_size=1)
+            nn.Conv2d(64, num_classes, kernel_size=1),
         )
 
     def forward(self, x):
-        # x: [B, num_patches + 1, embed_dim]
-        x = x[:, 1:, :]  # drop CLS
-        B, N, C = x.shape
-        H = W = int(np.sqrt(N))
-        x = x.transpose(1, 2).reshape(B, C, H, W)  # [B, C, H, W]
-        x = self.decoder(x)
-        return x
+        # remove cls token and reshape patch tokens back into 2d
+        x = x[:, 1:, :]
+        b, n, c = x.shape
+        hw = int(n ** 0.5)
+        x = x.transpose(1, 2).reshape(b, c, hw, hw)
+        return self.decoder(x)
 
 
-# ---------------------------------------------------------------------
-#  ViT backbone + head
-# ---------------------------------------------------------------------
 class ViTSegmentation(nn.Module):
-    """Vision Transformer for Segmentation with timm pretrained backbone"""
-    def __init__(
-        self,
-        num_classes: int = 3,
-        img_size: int = 224,
-        freeze_backbone: bool = False,
-        use_pretrained: bool = True,
-        vit_npz_path: Optional[str] = None,  # optional, not needed in practice
-    ):
+    def __init__(self, num_classes=3, img_size=224, freeze_backbone=True, use_pretrained=True):
         super().__init__()
 
         self.backbone = timm.create_model(
-            'vit_base_patch16_224',
+            "vit_base_patch16_224",
             pretrained=use_pretrained,
-            num_classes=0,      # remove classifier head
-            img_size=img_size
+            num_classes=0,
+            img_size=img_size,
         )
 
-        # Optional: override with .npz weights (not really needed)
-        if vit_npz_path:
-            self.load_vit_weights(vit_npz_path)
-
         if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+            for param in self.backbone.parameters():
+                param.requires_grad = False
 
         self.seg_head = ViTSegmentationHead(
             embed_dim=self.backbone.embed_dim,
             num_classes=num_classes,
-            img_size=img_size,
-            patch_size=self.backbone.patch_embed.patch_size[0]
         )
 
-    def load_vit_weights(self, npz_path: str):
-        logger.info(f"Loading ViT weights from {npz_path}")
-        try:
-            weights = np.load(npz_path)
-            state_dict = {}
-            for key in weights.files:
-                if 'Transformer/encoderblock' in key:
-                    new_key = key.replace('Transformer/encoderblock_', 'blocks.')
-                    new_key = new_key.replace('/LayerNorm_0/', '.norm1.')
-                    new_key = new_key.replace('/LayerNorm_2/', '.norm2.')
-                    new_key = new_key.replace('/MlpBlock_3/Dense_0/', '.mlp.fc1.')
-                    new_key = new_key.replace('/MlpBlock_3/Dense_1/', '.mlp.fc2.')
-                    state_dict[new_key] = torch.from_numpy(weights[key])
-                elif 'embedding' in key:
-                    new_key = key.replace('embedding/', 'patch_embed.')
-                    state_dict[new_key] = torch.from_numpy(weights[key])
-            self.backbone.load_state_dict(state_dict, strict=False)
-            logger.info("ViT .npz weights loaded successfully")
-        except Exception as e:
-            logger.warning(f"Could not load .npz weights: {e}. Using timm weights instead.")
-
     def forward(self, x):
-        feats = self.backbone.forward_features(x)   # [B, num_patches+1, C]
-        seg_map = self.seg_head(feats)
-        return seg_map
+        feats = self.backbone.forward_features(x)
+        return self.seg_head(feats)
 
 
-# --- Cross-teaching trainer ---
+def create_unet_tl():
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=NUM_CLASSES,
+        activation=None,
+    )
+
+    if config.freeze_unet_encoder:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+
+    return model
+
+
+@torch.no_grad()
+def compute_metrics(logits, target, num_classes):
+    pred = logits.argmax(dim=1)
+
+    pixel_acc = (pred == target).float().mean().item()
+
+    dice_scores = []
+    iou_scores = []
+
+    for cls in range(num_classes):
+        pred_cls = (pred == cls).float()
+        target_cls = (target == cls).float()
+
+        inter = (pred_cls * target_cls).sum().item()
+        pred_sum = pred_cls.sum().item()
+        target_sum = target_cls.sum().item()
+        union = pred_sum + target_sum - inter
+
+        dice = (2.0 * inter + 1e-6) / (pred_sum + target_sum + 1e-6)
+        iou = (inter + 1e-6) / (union + 1e-6)
+
+        dice_scores.append(dice)
+        iou_scores.append(iou)
+
+    return {
+        "dice": float(sum(dice_scores) / len(dice_scores)),
+        "iou": float(sum(iou_scores) / len(iou_scores)),
+        "pixel_accuracy": float(pixel_acc),
+    }
+
+
+@torch.no_grad()
+def evaluate_unet(model, dataloader, criterion, device):
+    model.eval()
+
+    total_loss = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    total_acc = 0.0
+    total_batches = 0
+
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        logits = model(images)
+        loss = criterion(logits, masks)
+        metrics = compute_metrics(logits, masks, NUM_CLASSES)
+
+        total_loss += loss.item()
+        total_dice += metrics["dice"]
+        total_iou += metrics["iou"]
+        total_acc += metrics["pixel_accuracy"]
+        total_batches += 1
+
+    return {
+        "loss": total_loss / max(total_batches, 1),
+        "dice": total_dice / max(total_batches, 1),
+        "iou": total_iou / max(total_batches, 1),
+        "pixel_accuracy": total_acc / max(total_batches, 1),
+    }
+
+
+@torch.no_grad()
+def evaluate_ensemble(unet_model, vit_model, dataloader, device):
+    unet_model.eval()
+    vit_model.eval()
+
+    total_dice = 0.0
+    total_iou = 0.0
+    total_acc = 0.0
+    total_batches = 0
+
+    for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        unet_images = F.interpolate(
+            images,
+            size=(config.unet_image_size, config.unet_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        vit_images = F.interpolate(
+            images,
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        unet_logits = unet_model(unet_images)
+        vit_logits = vit_model(vit_images)
+
+        # bring vit output to unet size before averaging
+        vit_logits = F.interpolate(
+            vit_logits,
+            size=(config.unet_image_size, config.unet_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        ensemble_logits = (unet_logits + vit_logits) / 2.0
+        metrics = compute_metrics(ensemble_logits, masks, NUM_CLASSES)
+
+        total_dice += metrics["dice"]
+        total_iou += metrics["iou"]
+        total_acc += metrics["pixel_accuracy"]
+        total_batches += 1
+
+    return {
+        "dice": total_dice / max(total_batches, 1),
+        "iou": total_iou / max(total_batches, 1),
+        "pixel_accuracy": total_acc / max(total_batches, 1),
+    }
+
+
 class CrossTeachingTrainer:
-    """Semi-supervised: U-Net and ViT swap pseudo-labels."""
-    def __init__(
-        self,
-        unet_model: nn.Module,
-        vit_model: nn.Module,
-        device: str = "cuda",
-        lr: float = 1e-4,
-        consistency_weight: float = 0.5,
-        confidence_threshold: float = 0.9,
-        unet_size: int = 512,
-        vit_size: int = 224,
-    ):
-        self.unet = unet_model.to(device)
-        self.vit = vit_model.to(device)
-        self.device = device
+    def __init__(self):
+        self.unet = create_unet_tl().to(config.device)
 
-        self.unet_size = unet_size
-        self.vit_size = vit_size
+        self.vit = ViTSegmentation(
+            num_classes=NUM_CLASSES,
+            img_size=config.vit_image_size,
+            freeze_backbone=config.freeze_vit_backbone,
+            use_pretrained=True,
+        ).to(config.device)
 
-        self.unet_optimizer = torch.optim.Adam(self.unet.parameters(), lr=lr)
-        self.vit_optimizer = torch.optim.Adam(self.vit.parameters(), lr=lr)
+        self.supervised_loss = CombinedSegmentationLoss(num_classes=NUM_CLASSES)
+        self.consistency_loss = MaskedCrossEntropyLoss()
 
-        self.consistency_weight = consistency_weight
-        self.confidence_threshold = confidence_threshold
+        self.unet_optimizer = optim.Adam(
+            [p for p in self.unet.parameters() if p.requires_grad],
+            lr=config.learning_rate,
+        )
 
-        self.supervised_loss = nn.CrossEntropyLoss()
+        self.vit_optimizer = optim.Adam(
+            [p for p in self.vit.parameters() if p.requires_grad],
+            lr=config.learning_rate,
+        )
 
-    # -------- utilities --------
-    def get_confidence_mask(self, pred, threshold):
-        probs = F.softmax(pred, dim=1)
-        max_probs, _ = probs.max(dim=1)
-        return (max_probs > threshold).float()
+    @staticmethod
+    def get_confidence_and_labels(logits):
+        probs = torch.softmax(logits, dim=1)
+        confidence, labels = probs.max(dim=1)
+        return confidence, labels
 
-    # -------- labeled step --------
-    def train_step_labeled(self, images, masks):
-        images = images.to(self.device)
-        masks = masks.to(self.device)
-        # keep 3-class mask 0,1,2 (no binarize)
+    def train_labeled_step(self, images, masks):
+        images = images.to(config.device)
+        masks = masks.to(config.device)
 
-        # U-Net: 3-channel RGB, 512x512
-        unet_images = images
-        if unet_images.shape[-1] != self.unet_size:
-            unet_images = F.interpolate(
-                unet_images, size=(self.unet_size, self.unet_size),
-                mode="bilinear", align_corners=False
-            )
-            masks_unet = F.interpolate(
-                masks.float().unsqueeze(1),
-                size=(self.unet_size, self.unet_size),
-                mode="nearest"
-            ).squeeze(1).long()
-        else:
-            masks_unet = masks
+        unet_images = F.interpolate(
+            images,
+            size=(config.unet_image_size, config.unet_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        # ViT expects 3 channels, 224x224
-        vit_images = images
-        if vit_images.shape[-1] != self.vit_size:
-            vit_images = F.interpolate(
-                vit_images, size=(self.vit_size, self.vit_size),
-                mode="bilinear", align_corners=False
-            )
-            masks_vit = F.interpolate(
-                masks.unsqueeze(1).float(),
-                size=(self.vit_size, self.vit_size),
-                mode="nearest"
-            ).squeeze(1).round().long()
-        else:
-            masks_vit = masks
+        vit_images = F.interpolate(
+            images,
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        # forward
-        unet_pred = self.unet(unet_images)   # [B,C,512,512]
-        vit_pred = self.vit(vit_images)      # [B,C,224,224]
+        vit_masks = F.interpolate(
+            masks.unsqueeze(1).float(),
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="nearest",
+        ).squeeze(1).long()
 
-        unet_loss = self.supervised_loss(unet_pred, masks_unet)
-        vit_loss = self.supervised_loss(vit_pred, masks_vit)
-
-        # backward
         self.unet_optimizer.zero_grad()
+        unet_logits = self.unet(unet_images)
+        unet_loss = self.supervised_loss(unet_logits, masks)
         unet_loss.backward()
         self.unet_optimizer.step()
 
         self.vit_optimizer.zero_grad()
+        vit_logits = self.vit(vit_images)
+        vit_loss = self.supervised_loss(vit_logits, vit_masks)
         vit_loss.backward()
         self.vit_optimizer.step()
 
-        return {"unet_loss": unet_loss.item(), "vit_loss": vit_loss.item()}
+        return {
+            "unet_supervised_loss": unet_loss.item(),
+            "vit_supervised_loss": vit_loss.item(),
+        }
 
-    # -------- unlabeled step (cross-teaching) --------
-    def train_step_unlabeled(self, images):
-        images = images.to(self.device)  # [B,3,H,W]
+    def train_unlabeled_step(self, images):
+        images = images.to(config.device)
 
-        # U-Net input: 3-channel
-        unet_images = images
-        if unet_images.shape[-1] != self.unet_size:
-            unet_images = F.interpolate(
-                unet_images, size=(self.unet_size, self.unet_size),
-                mode="bilinear", align_corners=False
-            )
+        unet_images = F.interpolate(
+            images,
+            size=(config.unet_image_size, config.unet_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        # Prepare ViT input
-        vit_images = images
-        if vit_images.shape[-1] != self.vit_size:
-            vit_images = F.interpolate(
-                vit_images, size=(self.vit_size, self.vit_size),
-                mode="bilinear", align_corners=False
-            )
+        vit_images = F.interpolate(
+            images,
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
 
         with torch.no_grad():
-            # teacher predictions
-            unet_teacher = self.unet(unet_images)        # [B,C,512,512]
-            vit_teacher = self.vit(vit_images)          # [B,C,224,224]
+            unet_teacher_logits = self.unet(unet_images)
+            vit_teacher_logits = self.vit(vit_images)
 
-            # confidence (for logging)
-            unet_conf = self.get_confidence_mask(unet_teacher, self.confidence_threshold)
-            vit_conf = self.get_confidence_mask(vit_teacher, self.confidence_threshold)
-
-            # create pseudo-labels in opposite model's resolution
-            # ViT -> U-Net (upsample to 512)
-            vit_teacher_512 = F.interpolate(
-                vit_teacher, size=(self.unet_size, self.unet_size),
-                mode="bilinear", align_corners=False
+            # vit teaches unet, so resize vit output up to unet size
+            vit_teacher_up = F.interpolate(
+                vit_teacher_logits,
+                size=(config.unet_image_size, config.unet_image_size),
+                mode="bilinear",
+                align_corners=False,
             )
-            vit_pseudo_labels_512 = vit_teacher_512.argmax(dim=1)   # [B,512,512]
+            vit_confidence, vit_labels = self.get_confidence_and_labels(vit_teacher_up)
+            vit_valid = (vit_confidence >= config.confidence_threshold).float()
 
-            # U-Net -> ViT (downsample to 224)
-            unet_teacher_224 = F.interpolate(
-                unet_teacher, size=(self.vit_size, self.vit_size),
-                mode="bilinear", align_corners=False
+            # unet teaches vit, so resize unet output down to vit size
+            unet_teacher_down = F.interpolate(
+                unet_teacher_logits,
+                size=(config.vit_image_size, config.vit_image_size),
+                mode="bilinear",
+                align_corners=False,
             )
-            unet_pseudo_labels_224 = unet_teacher_224.argmax(dim=1) # [B,224,224]
-
-        # ------- Train U-Net with ViT pseudo-labels -------
-        unet_pred = self.unet(unet_images)  # [B,C,512,512]
-        unet_consistency = self.supervised_loss(unet_pred, vit_pseudo_labels_512)
+            unet_confidence, unet_labels = self.get_confidence_and_labels(unet_teacher_down)
+            unet_valid = (unet_confidence >= config.confidence_threshold).float()
 
         self.unet_optimizer.zero_grad()
-        (self.consistency_weight * unet_consistency).backward()
+        unet_student_logits = self.unet(unet_images)
+        unet_consistency_loss = self.consistency_loss(unet_student_logits, vit_labels, vit_valid)
+        (config.consistency_weight * unet_consistency_loss).backward()
         self.unet_optimizer.step()
 
-        # ------- Train ViT with U-Net pseudo-labels -------
-        vit_pred = self.vit(vit_images)     # [B,C,224,224]
-        vit_consistency = self.supervised_loss(vit_pred, unet_pseudo_labels_224)
-
         self.vit_optimizer.zero_grad()
-        (self.consistency_weight * vit_consistency).backward()
+        vit_student_logits = self.vit(vit_images)
+        vit_consistency_loss = self.consistency_loss(vit_student_logits, unet_labels, unet_valid)
+        (config.consistency_weight * vit_consistency_loss).backward()
         self.vit_optimizer.step()
 
         return {
-            "unet_consistency_loss": unet_consistency.item(),
-            "vit_consistency_loss": vit_consistency.item(),
-            "unet_confidence": unet_conf.mean().item(),
-            "vit_confidence": vit_conf.mean().item(),
+            "unet_consistency_loss": unet_consistency_loss.item(),
+            "vit_consistency_loss": vit_consistency_loss.item(),
+            "vit_confident_pixel_ratio": vit_valid.mean().item(),
+            "unet_confident_pixel_ratio": unet_valid.mean().item(),
         }
 
-    # -------- epoch loop --------
-    def train_epoch(self, labeled_loader, unlabeled_loader, epoch: int):
+    def train_epoch(self, labeled_loader, unlabeled_loader):
         self.unet.train()
         self.vit.train()
 
         labeled_iter = iter(labeled_loader)
         unlabeled_iter = iter(unlabeled_loader)
+        num_steps = max(len(labeled_loader), len(unlabeled_loader))
 
-        num_batches = max(len(labeled_loader), len(unlabeled_loader))
-
-        metrics = {
-            "unet_loss": 0.0,
-            "vit_loss": 0.0,
-            "unet_consistency": 0.0,
-            "vit_consistency": 0.0,
+        totals = {
+            "unet_supervised_loss": 0.0,
+            "vit_supervised_loss": 0.0,
+            "unet_consistency_loss": 0.0,
+            "vit_consistency_loss": 0.0,
+            "vit_confident_pixel_ratio": 0.0,
+            "unet_confident_pixel_ratio": 0.0,
         }
 
-        for batch_idx in range(num_batches):
-            # labeled step
+        for _ in range(num_steps):
             try:
                 images_l, masks_l = next(labeled_iter)
-                labeled_metrics = self.train_step_labeled(images_l, masks_l)
-                metrics["unet_loss"] += labeled_metrics["unet_loss"]
-                metrics["vit_loss"] += labeled_metrics["vit_loss"]
             except StopIteration:
                 labeled_iter = iter(labeled_loader)
+                images_l, masks_l = next(labeled_iter)
 
-            # unlabeled step
+            labeled_stats = self.train_labeled_step(images_l, masks_l)
+
             try:
                 images_u = next(unlabeled_iter)
-                if isinstance(images_u, (list, tuple)):
-                    images_u = images_u[0]
-                unlabeled_metrics = self.train_step_unlabeled(images_u)
-                metrics["unet_consistency"] += unlabeled_metrics["unet_consistency_loss"]
-                metrics["vit_consistency"] += unlabeled_metrics["vit_consistency_loss"]
             except StopIteration:
                 unlabeled_iter = iter(unlabeled_loader)
+                images_u = next(unlabeled_iter)
 
-            if batch_idx % 10 == 0:
-                logger.info(f"Epoch {epoch}, Batch {batch_idx}/{num_batches}")
+            unlabeled_stats = self.train_unlabeled_step(images_u)
 
-        for k in metrics:
-            metrics[k] /= num_batches
+            for key, value in {**labeled_stats, **unlabeled_stats}.items():
+                totals[key] += value
 
-        logger.info(f"Epoch {epoch} - Metrics: {metrics}")
-        return metrics
+        for key in totals:
+            totals[key] /= max(num_steps, 1)
 
-    # -------- ensemble prediction (for evaluation / visualization) --------
-    def ensemble_predict(self, images):
-        self.unet.eval()
-        self.vit.eval()
-        with torch.no_grad():
-            images = images.to(self.device)  # [B,3,H,W]
-
-            # U-Net input
-            unet_images = images.mean(dim=1, keepdim=True)
-            unet_images = F.interpolate(
-                unet_images, size=(self.unet_size, self.unet_size),
-                mode="bilinear", align_corners=False
-            )
-            unet_logits = self.unet(unet_images)  # [B,C,512,512]
-            unet_probs = F.softmax(unet_logits, dim=1)
-
-            # ViT input
-            vit_images = images
-            vit_images = F.interpolate(
-                vit_images, size=(self.vit_size, self.vit_size),
-                mode="bilinear", align_corners=False
-            )
-            vit_logits = self.vit(vit_images)      # [B,C,224,224]
-            vit_logits_512 = F.interpolate(
-                vit_logits, size=(self.unet_size, self.unet_size),
-                mode="bilinear", align_corners=False
-            )
-            vit_probs = F.softmax(vit_logits_512, dim=1)
-
-            ensemble_probs = (unet_probs + vit_probs) / 2
-            return ensemble_probs  # [B,C,512,512]
+        return totals
 
 
-# --- U-Net: create fresh or load checkpoint ---
-def create_fresh_unet(device: str = "cuda"):
-    import segmentation_models_pytorch as smp
-    model = smp.Unet(
-        encoder_name="resnet34",
-        encoder_weights="imagenet",
-        in_channels=3,
-        classes=3,
-    )
-    model.to(device)
-    logger.info("Created fresh U-Net (no checkpoint).")
-    return model
-
-
-def load_unet_model(unet_path: str, device: str = "cuda"):
-    unet_model = create_fresh_unet(device)
-    path = Path(unet_path)
-    if not path.exists():
-        logger.info(f"No checkpoint at {unet_path}; using fresh U-Net.")
-        return unet_model
-    checkpoint = torch.load(path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    unet_model.load_state_dict(state_dict, strict=False)
-    unet_model.eval()
-    logger.info(f"Loaded U-Net from {unet_path}")
-    return unet_model
-
-# ---------------------------------------------------------------------
-#  Main
-# ---------------------------------------------------------------------
 def main():
-    _root = Path(__file__).resolve().parent
-    checkpoints_dir = _root / "checkpoints"
-    checkpoints_dir.mkdir(exist_ok=True)
-    unet_path = str(checkpoints_dir / "unet_oxford_pet.pth")
-    vit_path = str(checkpoints_dir / "vit_oxford_pet.pth")
+    set_seed()
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
-    num_classes = 3
-    unet_img_size = 512
-    vit_img_size = 224
-    batch_size = 8
-    num_epochs = 30
-    learning_rate = 1e-4
-    consistency_weight = 0.5
-    confidence_threshold = 0.9
-    unlabeled_fraction = 0.5  # half of train used as "unlabeled" for consistency
-
-    if torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-    logger.info(f"Using device: {device}")
-
-    from data_oxford_pet import get_oxford_pet_datasets_for_cross_teaching
-    labeled_loader, unlabeled_loader = get_oxford_pet_datasets_for_cross_teaching(
-        unet_img_size=unet_img_size,
-        batch_size=batch_size,
-        num_workers=0,
-        unlabeled_fraction=unlabeled_fraction,
-    )
-    logger.info(f"Labeled batches: {len(labeled_loader)}, Unlabeled batches: {len(unlabeled_loader)}")
-
-    # ===== Models =====
-    unet_model = load_unet_model(unet_path, device)
-
-    vit_model = ViTSegmentation(
-        num_classes=num_classes,
-        img_size=vit_img_size,
-        freeze_backbone=False,
-        use_pretrained=True,
-        vit_npz_path=None,
-    ).to(device)
-
-    # ===== Trainer =====
-    trainer = CrossTeachingTrainer(
-        unet_model=unet_model,
-        vit_model=vit_model,
-        device=device,
-        lr=learning_rate,
-        consistency_weight=consistency_weight,
-        confidence_threshold=confidence_threshold,
-        unet_size=unet_img_size,
-        vit_size=vit_img_size,
+    labeled_loader, unlabeled_loader, val_loader, test_loader = get_oxford_pet_datasets_for_cross_teaching(
+        unet_img_size=config.unet_image_size,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        unlabeled_fraction=config.unlabeled_fraction,
+        val_fraction=config.val_fraction,
     )
 
-    # ===== Training loop =====
-    for epoch in range(num_epochs):
-        metrics = trainer.train_epoch(labeled_loader, unlabeled_loader, epoch)
+    trainer = CrossTeachingTrainer()
 
-        if (epoch + 1) % 10 == 0:
-            torch.save(trainer.unet.state_dict(), checkpoints_dir / f"unet_epoch_{epoch+1}.pth")
-            torch.save(trainer.vit.state_dict(), checkpoints_dir / f"vit_epoch_{epoch+1}.pth")
+    best_val_dice = -1.0
+    history = []
 
-    torch.save(trainer.unet.state_dict(), unet_path)
-    torch.save(trainer.vit.state_dict(), vit_path)
-    logger.info(f"Saved final models to {checkpoints_dir}")
+    for epoch in range(config.epochs):
+        train_stats = trainer.train_epoch(labeled_loader, unlabeled_loader)
+
+        unet_val_metrics = evaluate_unet(
+            trainer.unet,
+            val_loader,
+            trainer.supervised_loss,
+            config.device,
+        )
+
+        ensemble_val_metrics = evaluate_ensemble(
+            trainer.unet,
+            trainer.vit,
+            val_loader,
+            config.device,
+        )
+
+        row = {
+            "epoch": epoch + 1,
+            "unet_supervised_loss": train_stats["unet_supervised_loss"],
+            "vit_supervised_loss": train_stats["vit_supervised_loss"],
+            "unet_consistency_loss": train_stats["unet_consistency_loss"],
+            "vit_consistency_loss": train_stats["vit_consistency_loss"],
+            "unet_confident_pixel_ratio": train_stats["unet_confident_pixel_ratio"],
+            "vit_confident_pixel_ratio": train_stats["vit_confident_pixel_ratio"],
+            "unet_val_loss": unet_val_metrics["loss"],
+            "unet_val_dice": unet_val_metrics["dice"],
+            "unet_val_iou": unet_val_metrics["iou"],
+            "ensemble_val_dice": ensemble_val_metrics["dice"],
+            "ensemble_val_iou": ensemble_val_metrics["iou"],
+            "ensemble_val_pixel_accuracy": ensemble_val_metrics["pixel_accuracy"],
+        }
+        history.append(row)
+
+        print(
+            f"[Cross-Teaching] epoch {epoch + 1}/{config.epochs} "
+            f"ensemble_val_dice={ensemble_val_metrics['dice']:.4f} "
+            f"unet_val_dice={unet_val_metrics['dice']:.4f}"
+        )
+
+        if ensemble_val_metrics["dice"] > best_val_dice:
+            best_val_dice = ensemble_val_metrics["dice"]
+
+            torch.save(
+                {
+                    "model_state_dict": trainer.unet.state_dict(),
+                    "best_val_dice": best_val_dice,
+                },
+                UNET_SAVE_PATH,
+            )
+
+            torch.save(
+                {
+                    "model_state_dict": trainer.vit.state_dict(),
+                    "best_val_dice": best_val_dice,
+                },
+                VIT_SAVE_PATH,
+            )
+
+    unet_checkpoint = torch.load(UNET_SAVE_PATH, map_location=config.device)
+    vit_checkpoint = torch.load(VIT_SAVE_PATH, map_location=config.device)
+
+    trainer.unet.load_state_dict(unet_checkpoint["model_state_dict"])
+    trainer.vit.load_state_dict(vit_checkpoint["model_state_dict"])
+
+    unet_test_metrics = evaluate_unet(
+        trainer.unet,
+        test_loader,
+        trainer.supervised_loss,
+        config.device,
+    )
+
+    ensemble_test_metrics = evaluate_ensemble(
+        trainer.unet,
+        trainer.vit,
+        test_loader,
+        config.device,
+    )
+
+    save_json(
+        METRICS_SAVE_PATH,
+        {
+            "model": "Cross-Teaching U-Net + ViT",
+            "setting": "semi-supervised",
+            "unlabeled_fraction": config.unlabeled_fraction,
+            "confidence_threshold": config.confidence_threshold,
+            "consistency_weight": config.consistency_weight,
+            "best_val_ensemble_dice": best_val_dice,
+            "history": history,
+            "test_metrics": {
+                "unet": unet_test_metrics,
+                "ensemble": ensemble_test_metrics,
+            },
+        },
+    )
+
+    print(f"Saved best U-Net cross-teaching model to {UNET_SAVE_PATH}")
+    print(f"Saved best ViT cross-teaching model to {VIT_SAVE_PATH}")
+    print(f"Saved metrics to {METRICS_SAVE_PATH}")
 
 
 if __name__ == "__main__":

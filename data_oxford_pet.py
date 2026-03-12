@@ -1,8 +1,12 @@
-# Oxford-IIIT Pet via TFDS. Trimap 1,2,3 -> 0,1,2 (pet, bg, boundary).
+"""
+Dataset utilities for Oxford-IIIT Pet segmentation.
+"""
 
 from __future__ import annotations
+import random
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
@@ -23,18 +27,24 @@ class OxfordPetDataset(Dataset):
         augment: bool = False,
         in_memory: bool = True, # Kept for compatibility, but we behave 'lazily' now
     ):
+    def __init__(self, split, size=(256, 256), augment=False):
         self.split = split
-        self.target_size = target_size
+        self.size = normalize_size(size)
         self.augment = augment
 
         # Load the dataset metadata/generator
         print(f"Initializing {split} split (Lazy Loading enabled to prevent 'Killed' error)...")
+
         ds = tfds.load("oxford_iiit_pet", split=split)
         
         # Convert to a list of numpy dictionaries. 
         # Crucially, we store the RAW compressed data, not the expanded 512x512 float32 tensors.
         self._examples = list(tfds.as_numpy(ds)) 
         print(f"Metadata for {len(self._examples)} examples loaded.")
+        self.data = list(tfds.as_numpy(ds))
+
+    def __len__(self):
+        return len(self.data)
 
     def __len__(self) -> int:
         return len(self._examples)
@@ -57,6 +67,7 @@ class OxfordPetDataset(Dataset):
         # 3. Augmentation (happens on CPU)
         if self.augment:
             img_np, mask_np = _augment_pair(img_np, mask_np)
+            img, mask = self.augment_pair(img, mask)
 
         # 4. Final Conversion to PyTorch Tensors
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() # CHW
@@ -69,6 +80,15 @@ def _augment_pair(img: np.ndarray, mask: np.ndarray):
     # Note: img is already 0.0-1.0 here
     pil_img = Image.fromarray((img * 255).astype(np.uint8))
     pil_mask = Image.fromarray(mask.astype(np.uint8))
+        img = torch.from_numpy(img).permute(2, 0, 1).float()
+        mask = torch.from_numpy(mask).long()
+
+        return img, mask
+
+    def augment_pair(self, img, mask):
+        # light augmentation for training only
+        img_pil = Image.fromarray((img * 255).astype(np.uint8))
+        mask_pil = Image.fromarray(mask.astype(np.uint8))
 
     if random.random() > 0.5:
         pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -107,6 +127,68 @@ def get_fixed_splits(
     )
     
     test_ds = OxfordPetDataset("test", target_size=target_size, augment=False)
+class SubsetDataset(Dataset):
+    def __init__(self, base_dataset, indices):
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.base_dataset[self.indices[idx]]
+
+
+class ImageOnlyDataset(Dataset):
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        image, _ = self.base_dataset[idx]
+        return image
+
+
+def get_split_indices(val_fraction=DEFAULT_VAL_FRACTION, seed=DATA_SEED):
+    # one fixed train/val split for all experiments
+    full_train = tfds.load("oxford_iiit_pet", split="train")
+    n = len(list(tfds.as_numpy(full_train)))
+
+    indices = np.arange(n)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+
+    val_size = max(1, int(round(n * val_fraction)))
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+
+    return train_indices.tolist(), val_indices.tolist()
+
+
+def get_train_val_test_datasets(
+    size=(256, 256),
+    val_fraction=DEFAULT_VAL_FRACTION,
+    labeled_fraction=1.0,
+):
+    size = normalize_size(size)
+    train_indices, val_indices = get_split_indices(val_fraction=val_fraction)
+
+    # separate train and val base datasets so val does not get train augmentation
+    train_base = OxfordPetDataset("train", size=size, augment=True)
+    val_base = OxfordPetDataset("train", size=size, augment=False)
+
+    train_ds = SubsetDataset(train_base, train_indices)
+    val_ds = SubsetDataset(val_base, val_indices)
+    test_ds = OxfordPetDataset("test", size=size, augment=False)
+
+    if labeled_fraction < 1.0:
+        # for supervised baselines, only use part of the train masks
+        n_labeled = max(1, int(round(len(train_ds) * labeled_fraction)))
+        labeled_indices = list(range(n_labeled))
+        train_ds = SubsetDataset(train_ds, labeled_indices)
+
     return train_ds, val_ds, test_ds
 
 
@@ -122,56 +204,79 @@ def get_train_val_test_loaders(
     """
     train_ds, val_ds, test_ds = get_fixed_splits(target_size=target_size, val_fraction=val_fraction)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
     )
+
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
     )
+
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
     )
+
     return train_loader, val_loader, test_loader
 
 
-class _UnlabeledOnlyDataset(Dataset):
-    """Wraps a dataset; __getitem__ returns only (image,). Masks are never used in cross-teaching unlabeled step."""
-
-    def __init__(self, base_dataset):
-        self.base = base_dataset
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx):
-        img, _ = self.base[idx]
-        return (img,)
-
-
 def get_oxford_pet_datasets_for_cross_teaching(
-    unet_img_size: int = 512,
-    batch_size: int = 8,
-    num_workers: int = 0,
-    unlabeled_fraction: float = 0.5,
-    val_fraction: float = 0.1,
+    unet_img_size=512,
+    batch_size=8,
+    num_workers=0,
+    unlabeled_fraction=0.8,
+    val_fraction=DEFAULT_VAL_FRACTION,
 ):
-    """
-    Same train split as get_train_val_test_loaders (DATA_SEED). Labeled = part of train (with masks
-    for supervised loss). Unlabeled = rest of train, images only (no masks used for consistency).
-    Returns labeled_loader, unlabeled_loader.
-    """
-    train_ds, val_ds, test_ds = get_fixed_splits(
-        target_size=(unet_img_size, unet_img_size), val_fraction=val_fraction
+    train_ds, val_ds, test_ds = get_train_val_test_datasets(
+        size=(unet_img_size, unet_img_size),
+        val_fraction=val_fraction,
+        labeled_fraction=1.0,
     )
-    n_labeled = max(1, len(train_ds) - int(len(train_ds) * unlabeled_fraction))
-    n_unlabeled = len(train_ds) - n_labeled
-    labeled_subset, unlabeled_subset = torch.utils.data.random_split(
-        train_ds, [n_labeled, n_unlabeled], generator=torch.Generator().manual_seed(DATA_SEED)
-    )
+
+    n_train = len(train_ds)
+    n_unlabeled = max(1, int(round(n_train * unlabeled_fraction)))
+    n_labeled = max(1, n_train - n_unlabeled)
+
+    labeled_indices = list(range(n_labeled))
+    unlabeled_indices = list(range(n_labeled, n_labeled + n_unlabeled))
+
+    labeled_subset = SubsetDataset(train_ds, labeled_indices)
+    unlabeled_subset = SubsetDataset(train_ds, unlabeled_indices)
+    unlabeled_subset = ImageOnlyDataset(unlabeled_subset)
+
     labeled_loader = DataLoader(
-        labeled_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False
+        labeled_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
     )
-    unlabeled_only = _UnlabeledOnlyDataset(unlabeled_subset)
+
     unlabeled_loader = DataLoader(
-        unlabeled_only, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False
+        unlabeled_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
     )
-    return labeled_loader, unlabeled_loader
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    return labeled_loader, unlabeled_loader, val_loader, test_loader

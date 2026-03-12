@@ -1,16 +1,11 @@
-# Core (existing)
 torch
 torchvision
-tensorflow-datasets>=4.9.0
-tensorflow>=2.12.0
-segmentation-models-pytorch
-timm
-tifffile
+tensorflow
+tensorflow-datasets
 numpy
-Pillow
-scikit-learn
-scikit-image
-pandas
 matplotlib
-seaborn
-tqdm
+Pillow
+timm
+segmentation-models-pytorch
+jupyter
+notebook
