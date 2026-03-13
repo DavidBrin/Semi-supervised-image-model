@@ -32,6 +32,7 @@ class Config:
     labeled_fraction = DEFAULT_LABELED_FRACTION
     confidence_threshold = 0.75
     consistency_weight = 0.5
+    consistency_warmup_epochs = 2
     freeze_unet_encoder = True
     freeze_vit_backbone = True
     num_workers = 0
@@ -88,12 +89,17 @@ class MaskedCrossEntropyLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, logits, pseudo_labels, valid_mask):
-        # only train on pseudo labels from images that pass the confidence threshold
+        # Only train on pseudo labels from images that pass the confidence threshold.
         per_pixel_loss = self.ce(logits, pseudo_labels)
         if valid_mask.dim() == 1:
             valid_mask = valid_mask.view(-1, 1, 1)
+        valid_mask = valid_mask.to(per_pixel_loss.dtype).expand_as(per_pixel_loss)
+        denom = valid_mask.sum()
+
+        if denom.item() == 0:
+            return per_pixel_loss.new_zeros(())
+
         masked_loss = per_pixel_loss * valid_mask
-        denom = valid_mask.sum().clamp_min(1.0)
         return masked_loss.sum() / denom
 
 
@@ -422,6 +428,11 @@ class CrossTeachingTrainer:
             align_corners=False,
         )
 
+        unet_was_training = self.unet.training
+        vit_was_training = self.vit.training
+        self.unet.eval()
+        self.vit.eval()
+
         with torch.no_grad():
             unet_teacher_logits = self.unet(unet_images)
             vit_teacher_logits = self.vit(vit_images)
@@ -446,6 +457,11 @@ class CrossTeachingTrainer:
             unet_confidence, unet_labels = self.get_confidence_and_labels(unet_teacher_down)
             unet_valid = (unet_confidence >= config.confidence_threshold).float()
 
+        if unet_was_training:
+            self.unet.train()
+        if vit_was_training:
+            self.vit.train()
+
         self.unet_optimizer.zero_grad()
         unet_student_logits = self.unet(unet_images)
         unet_consistency_loss = self.consistency_loss(unet_student_logits, vit_labels, vit_valid)
@@ -465,7 +481,7 @@ class CrossTeachingTrainer:
             "unet_confident_image_ratio": unet_valid.mean().item(),
         }
 
-    def train_epoch(self, labeled_loader, unlabeled_loader):
+    def train_epoch(self, labeled_loader, unlabeled_loader, epoch_idx):
         self.unet.train()
         self.vit.train()
 
@@ -498,7 +514,15 @@ class CrossTeachingTrainer:
                 unlabeled_iter = iter(unlabeled_loader)
                 images_u = next(unlabeled_iter)
 
-            unlabeled_stats = self.train_unlabeled_step(images_u)
+            if epoch_idx >= config.consistency_warmup_epochs:
+                unlabeled_stats = self.train_unlabeled_step(images_u)
+            else:
+                unlabeled_stats = {
+                    "unet_consistency_loss": 0.0,
+                    "vit_consistency_loss": 0.0,
+                    "vit_confident_image_ratio": 0.0,
+                    "unet_confident_image_ratio": 0.0,
+                }
 
             for key, value in {**labeled_stats, **unlabeled_stats}.items():
                 totals[key] += value
@@ -529,7 +553,7 @@ def main():
     history = []
 
     for epoch in range(config.epochs):
-        train_stats = trainer.train_epoch(labeled_loader, unlabeled_loader)
+        train_stats = trainer.train_epoch(labeled_loader, unlabeled_loader, epoch)
 
         unet_val_metrics = evaluate_unet(
             trainer.unet,
@@ -634,6 +658,7 @@ def main():
             "unlabeled_fraction": unlabeled_fraction,
             "confidence_threshold": config.confidence_threshold,
             "consistency_weight": config.consistency_weight,
+            "consistency_warmup_epochs": config.consistency_warmup_epochs,
             "best_val_ensemble_dice": best_val_dice,
             "history": history,
             "test_metrics": {
