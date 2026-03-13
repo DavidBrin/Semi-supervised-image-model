@@ -1,0 +1,30 @@
+{
+  "model": "Cross-Teaching U-Net + ViT",
+  "setting": "semi-supervised",
+  "notes": "Validation re-evaluation of the saved best checkpoint after fixing consistency-loss scaling and adding warmup. Full training/test rerun not completed in this session because CPU-only execution was too slow.",
+  "labeled_fraction": 0.2,
+  "unlabeled_fraction": 0.8,
+  "confidence_threshold": 0.75,
+  "consistency_weight": 0.5,
+  "consistency_warmup_epochs": 2,
+  "best_val_dice_from_checkpoint": 0.8381169559130109,
+  "validation_metrics": {
+    "unet": {
+      "loss": 0.5388954528000044,
+      "dice": 0.8258544701153001,
+      "iou": 0.7234349562791101,
+      "pixel_accuracy": 0.8925411804862644
+    },
+    "vit": {
+      "loss": 0.7224898312402808,
+      "dice": 0.7501593176703976,
+      "iou": 0.6349257233987653,
+      "pixel_accuracy": 0.849450637464938
+    },
+    "ensemble": {
+      "dice": 0.8393402827652896,
+      "iou": 0.7456422317041935,
+      "pixel_accuracy": 0.910236348276553
+    }
+  }
+}
