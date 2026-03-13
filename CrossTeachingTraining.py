@@ -88,8 +88,10 @@ class MaskedCrossEntropyLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, logits, pseudo_labels, valid_mask):
-        # only train on pseudo labels that pass the confidence threshold
+        # only train on pseudo labels from images that pass the confidence threshold
         per_pixel_loss = self.ce(logits, pseudo_labels)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.view(-1, 1, 1)
         masked_loss = per_pixel_loss * valid_mask
         denom = valid_mask.sum().clamp_min(1.0)
         return masked_loss.sum() / denom
@@ -358,8 +360,9 @@ class CrossTeachingTrainer:
     @staticmethod
     def get_confidence_and_labels(logits):
         probs = torch.softmax(logits, dim=1)
-        confidence, labels = probs.max(dim=1)
-        return confidence, labels
+        pixel_confidence, labels = probs.max(dim=1)
+        image_confidence = pixel_confidence.mean(dim=(1, 2))
+        return image_confidence, labels
 
     def train_labeled_step(self, images, masks):
         images = images.to(config.device, non_blocking=config.device.type == "cuda")
@@ -458,8 +461,8 @@ class CrossTeachingTrainer:
         return {
             "unet_consistency_loss": unet_consistency_loss.item(),
             "vit_consistency_loss": vit_consistency_loss.item(),
-            "vit_confident_pixel_ratio": vit_valid.mean().item(),
-            "unet_confident_pixel_ratio": unet_valid.mean().item(),
+            "vit_confident_image_ratio": vit_valid.mean().item(),
+            "unet_confident_image_ratio": unet_valid.mean().item(),
         }
 
     def train_epoch(self, labeled_loader, unlabeled_loader):
@@ -476,8 +479,8 @@ class CrossTeachingTrainer:
             "vit_supervised_loss": 0.0,
             "unet_consistency_loss": 0.0,
             "vit_consistency_loss": 0.0,
-            "vit_confident_pixel_ratio": 0.0,
-            "unet_confident_pixel_ratio": 0.0,
+            "vit_confident_image_ratio": 0.0,
+            "unet_confident_image_ratio": 0.0,
         }
 
         for _ in range(num_steps):
@@ -555,8 +558,8 @@ def main():
             "vit_supervised_loss": train_stats["vit_supervised_loss"],
             "unet_consistency_loss": train_stats["unet_consistency_loss"],
             "vit_consistency_loss": train_stats["vit_consistency_loss"],
-            "unet_confident_pixel_ratio": train_stats["unet_confident_pixel_ratio"],
-            "vit_confident_pixel_ratio": train_stats["vit_confident_pixel_ratio"],
+            "unet_confident_image_ratio": train_stats["unet_confident_image_ratio"],
+            "vit_confident_image_ratio": train_stats["vit_confident_image_ratio"],
             "unet_val_loss": unet_val_metrics["loss"],
             "unet_val_dice": unet_val_metrics["dice"],
             "unet_val_iou": unet_val_metrics["iou"],
