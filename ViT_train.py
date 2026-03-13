@@ -18,7 +18,7 @@ from data_oxford_pet import (
 
 class Config:
     image_size = 224
-    batch_size = 8
+    batch_size = 4
     epochs = 8
     learning_rate = 1e-4
     val_fraction = DEFAULT_VAL_FRACTION
@@ -176,8 +176,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         images, masks = resize_for_vit(images, masks)
 
@@ -204,8 +204,8 @@ def evaluate_model(model, dataloader, criterion, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         images, masks = resize_for_vit(images, masks)
 
@@ -232,9 +232,18 @@ def save_json(path, payload):
         json.dump(payload, f, indent=2)
 
 
+def describe_device(device):
+    if device.type == "cuda":
+        return f"cuda ({torch.cuda.get_device_name(device.index or 0)})"
+    if device.type == "mps":
+        return "mps"
+    return "cpu"
+
+
 def main():
     set_seed()
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    print(f"[ViT] using device: {describe_device(config.device)}")
 
     # use same data split setup as U-Net so comparison is fair
     train_loader, val_loader, test_loader = get_train_val_test_loaders(

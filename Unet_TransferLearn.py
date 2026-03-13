@@ -118,8 +118,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         optimizer.zero_grad()
         logits = model(images)
@@ -144,8 +144,8 @@ def evaluate_model(model, dataloader, criterion, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         logits = model(images)
         loss = criterion(logits, masks)
@@ -170,9 +170,18 @@ def save_json(path, payload):
         json.dump(payload, f, indent=2)
 
 
+def describe_device(device):
+    if device.type == "cuda":
+        return f"cuda ({torch.cuda.get_device_name(device.index or 0)})"
+    if device.type == "mps":
+        return "mps"
+    return "cpu"
+
+
 def main():
     set_seed()
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    print(f"[U-Net] using device: {describe_device(config.device)}")
 
     train_loader, val_loader, test_loader = get_train_val_test_loaders(
         target_size=config.image_size,

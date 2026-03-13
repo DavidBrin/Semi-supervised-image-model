@@ -14,6 +14,7 @@ except ImportError:
     raise
 
 from data_oxford_pet import (
+    DEFAULT_LABELED_FRACTION,
     DEFAULT_VAL_FRACTION,
     NUM_CLASSES,
     get_oxford_pet_datasets_for_cross_teaching,
@@ -28,7 +29,7 @@ class Config:
     epochs = 8
     learning_rate = 1e-4
     val_fraction = DEFAULT_VAL_FRACTION
-    unlabeled_fraction = 0.8
+    labeled_fraction = DEFAULT_LABELED_FRACTION
     confidence_threshold = 0.75
     consistency_weight = 0.5
     freeze_unet_encoder = True
@@ -49,6 +50,14 @@ METRICS_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "cross_teaching_metrics.json")
 def save_json(path, payload):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def describe_device(device):
+    if device.type == "cuda":
+        return f"cuda ({torch.cuda.get_device_name(device.index or 0)})"
+    if device.type == "mps":
+        return "mps"
+    return "cpu"
 
 
 class CombinedSegmentationLoss(nn.Module):
@@ -202,12 +211,57 @@ def evaluate_unet(model, dataloader, criterion, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         logits = model(images)
         loss = criterion(logits, masks)
         metrics = compute_metrics(logits, masks, NUM_CLASSES)
+
+        total_loss += loss.item()
+        total_dice += metrics["dice"]
+        total_iou += metrics["iou"]
+        total_acc += metrics["pixel_accuracy"]
+        total_batches += 1
+
+    return {
+        "loss": total_loss / max(total_batches, 1),
+        "dice": total_dice / max(total_batches, 1),
+        "iou": total_iou / max(total_batches, 1),
+        "pixel_accuracy": total_acc / max(total_batches, 1),
+    }
+
+
+@torch.no_grad()
+def evaluate_vit(model, dataloader, criterion, device):
+    model.eval()
+
+    total_loss = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    total_acc = 0.0
+    total_batches = 0
+
+    for images, masks in dataloader:
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
+
+        vit_images = F.interpolate(
+            images,
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        vit_masks = F.interpolate(
+            masks.unsqueeze(1).float(),
+            size=(config.vit_image_size, config.vit_image_size),
+            mode="nearest",
+        ).squeeze(1).long()
+
+        logits = model(vit_images)
+        loss = criterion(logits, vit_masks)
+        metrics = compute_metrics(logits, vit_masks, NUM_CLASSES)
 
         total_loss += loss.item()
         total_dice += metrics["dice"]
@@ -234,8 +288,8 @@ def evaluate_ensemble(unet_model, vit_model, dataloader, device):
     total_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, non_blocking=device.type == "cuda")
 
         unet_images = F.interpolate(
             images,
@@ -308,8 +362,8 @@ class CrossTeachingTrainer:
         return confidence, labels
 
     def train_labeled_step(self, images, masks):
-        images = images.to(config.device)
-        masks = masks.to(config.device)
+        images = images.to(config.device, non_blocking=config.device.type == "cuda")
+        masks = masks.to(config.device, non_blocking=config.device.type == "cuda")
 
         unet_images = F.interpolate(
             images,
@@ -349,7 +403,7 @@ class CrossTeachingTrainer:
         }
 
     def train_unlabeled_step(self, images):
-        images = images.to(config.device)
+        images = images.to(config.device, non_blocking=config.device.type == "cuda")
 
         unet_images = F.interpolate(
             images,
@@ -414,7 +468,8 @@ class CrossTeachingTrainer:
 
         labeled_iter = iter(labeled_loader)
         unlabeled_iter = iter(unlabeled_loader)
-        num_steps = max(len(labeled_loader), len(unlabeled_loader))
+        # Keep one supervised pass per epoch so labeled exposure matches the baselines.
+        num_steps = len(labeled_loader)
 
         totals = {
             "unet_supervised_loss": 0.0,
@@ -454,12 +509,14 @@ class CrossTeachingTrainer:
 def main():
     set_seed()
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    unlabeled_fraction = 1.0 - config.labeled_fraction
+    print(f"[Cross-Teaching] using device: {describe_device(config.device)}")
 
     labeled_loader, unlabeled_loader, val_loader, test_loader = get_oxford_pet_datasets_for_cross_teaching(
         unet_img_size=config.unet_image_size,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
-        unlabeled_fraction=config.unlabeled_fraction,
+        labeled_fraction=config.labeled_fraction,
         val_fraction=config.val_fraction,
     )
 
@@ -473,6 +530,13 @@ def main():
 
         unet_val_metrics = evaluate_unet(
             trainer.unet,
+            val_loader,
+            trainer.supervised_loss,
+            config.device,
+        )
+
+        vit_val_metrics = evaluate_vit(
+            trainer.vit,
             val_loader,
             trainer.supervised_loss,
             config.device,
@@ -496,6 +560,9 @@ def main():
             "unet_val_loss": unet_val_metrics["loss"],
             "unet_val_dice": unet_val_metrics["dice"],
             "unet_val_iou": unet_val_metrics["iou"],
+            "vit_val_loss": vit_val_metrics["loss"],
+            "vit_val_dice": vit_val_metrics["dice"],
+            "vit_val_iou": vit_val_metrics["iou"],
             "ensemble_val_dice": ensemble_val_metrics["dice"],
             "ensemble_val_iou": ensemble_val_metrics["iou"],
             "ensemble_val_pixel_accuracy": ensemble_val_metrics["pixel_accuracy"],
@@ -505,7 +572,8 @@ def main():
         print(
             f"[Cross-Teaching] epoch {epoch + 1}/{config.epochs} "
             f"ensemble_val_dice={ensemble_val_metrics['dice']:.4f} "
-            f"unet_val_dice={unet_val_metrics['dice']:.4f}"
+            f"unet_val_dice={unet_val_metrics['dice']:.4f} "
+            f"vit_val_dice={vit_val_metrics['dice']:.4f}"
         )
 
         if ensemble_val_metrics["dice"] > best_val_dice:
@@ -540,6 +608,13 @@ def main():
         config.device,
     )
 
+    vit_test_metrics = evaluate_vit(
+        trainer.vit,
+        test_loader,
+        trainer.supervised_loss,
+        config.device,
+    )
+
     ensemble_test_metrics = evaluate_ensemble(
         trainer.unet,
         trainer.vit,
@@ -552,13 +627,15 @@ def main():
         {
             "model": "Cross-Teaching U-Net + ViT",
             "setting": "semi-supervised",
-            "unlabeled_fraction": config.unlabeled_fraction,
+            "labeled_fraction": config.labeled_fraction,
+            "unlabeled_fraction": unlabeled_fraction,
             "confidence_threshold": config.confidence_threshold,
             "consistency_weight": config.consistency_weight,
             "best_val_ensemble_dice": best_val_dice,
             "history": history,
             "test_metrics": {
                 "unet": unet_test_metrics,
+                "vit": vit_test_metrics,
                 "ensemble": ensemble_test_metrics,
             },
         },
