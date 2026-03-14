@@ -15,7 +15,7 @@ except ImportError:
     print("Please install segmentation-models-pytorch first.")
     raise
 
-from data_oxford_pet import NUM_CLASSES
+NUM_SEGMENTATION_CLASSES = 3
 
 
 ROOT_DIR = Path(__file__).resolve().parent
