@@ -30,8 +30,9 @@ class Config:
     learning_rate = 1e-4
     val_fraction = DEFAULT_VAL_FRACTION
     labeled_fraction = DEFAULT_LABELED_FRACTION
-    confidence_threshold = 0.75
-    consistency_weight = 0.5
+    confidence_threshold = 0.85
+    consistency_weight = 0.1
+    consistency_warmup_epochs = 3
     freeze_unet_encoder = True
     freeze_vit_backbone = True
     num_workers = 0
