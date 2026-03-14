@@ -30,9 +30,9 @@ class Config:
     learning_rate = 1e-4
     val_fraction = DEFAULT_VAL_FRACTION
     labeled_fraction = DEFAULT_LABELED_FRACTION
-    confidence_threshold = 0.85
-    consistency_weight = 0.1
-    consistency_warmup_epochs = 3
+    confidence_threshold = 0.75
+    consistency_weight = 0.05
+    consistency_warmup_epochs = 2
     freeze_unet_encoder = True
     freeze_vit_backbone = True
     num_workers = 0
@@ -46,6 +46,8 @@ CHECKPOINTS_DIR = os.path.join(ROOT_DIR, "checkpoints")
 UNET_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "unet_cross_teaching_best.pth")
 VIT_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "vit_cross_teaching_best.pth")
 METRICS_SAVE_PATH = os.path.join(CHECKPOINTS_DIR, "cross_teaching_metrics.json")
+UNET_BASELINE_PATH = os.path.join(CHECKPOINTS_DIR, "unet_oxford_pet.pth")
+VIT_BASELINE_PATH = os.path.join(CHECKPOINTS_DIR, "vit_oxford_pet.pth")
 
 
 def save_json(path, payload):
@@ -59,6 +61,17 @@ def describe_device(device):
     if device.type == "mps":
         return "mps"
     return "cpu"
+
+
+def maybe_load_model_checkpoint(model, checkpoint_path, device, label):
+    if not os.path.exists(checkpoint_path):
+        print(f"[Cross-Teaching] no {label} checkpoint found at {checkpoint_path}; training from ImageNet initialization")
+        return False
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"[Cross-Teaching] loaded {label} checkpoint from {checkpoint_path}")
+    return True
 
 
 class CombinedSegmentationLoss(nn.Module):
@@ -89,12 +102,17 @@ class MaskedCrossEntropyLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, logits, pseudo_labels, valid_mask):
-        # only train on pseudo labels from images that pass the confidence threshold
+        # Only train on pseudo labels from images that pass the confidence threshold.
         per_pixel_loss = self.ce(logits, pseudo_labels)
         if valid_mask.dim() == 1:
             valid_mask = valid_mask.view(-1, 1, 1)
+        valid_mask = valid_mask.to(per_pixel_loss.dtype).expand_as(per_pixel_loss)
+        denom = valid_mask.sum()
+
+        if denom.item() == 0:
+            return per_pixel_loss.new_zeros(())
+
         masked_loss = per_pixel_loss * valid_mask
-        denom = valid_mask.sum().clamp_min(1.0)
         return masked_loss.sum() / denom
 
 
@@ -358,6 +376,19 @@ class CrossTeachingTrainer:
             lr=config.learning_rate,
         )
 
+        self.loaded_unet_baseline = maybe_load_model_checkpoint(
+            self.unet,
+            UNET_BASELINE_PATH,
+            config.device,
+            "U-Net baseline",
+        )
+        self.loaded_vit_baseline = maybe_load_model_checkpoint(
+            self.vit,
+            VIT_BASELINE_PATH,
+            config.device,
+            "ViT baseline",
+        )
+
     @staticmethod
     def get_confidence_and_labels(logits):
         probs = torch.softmax(logits, dim=1)
@@ -423,6 +454,11 @@ class CrossTeachingTrainer:
             align_corners=False,
         )
 
+        unet_was_training = self.unet.training
+        vit_was_training = self.vit.training
+        self.unet.eval()
+        self.vit.eval()
+
         with torch.no_grad():
             unet_teacher_logits = self.unet(unet_images)
             vit_teacher_logits = self.vit(vit_images)
@@ -447,6 +483,11 @@ class CrossTeachingTrainer:
             unet_confidence, unet_labels = self.get_confidence_and_labels(unet_teacher_down)
             unet_valid = (unet_confidence >= config.confidence_threshold).float()
 
+        if unet_was_training:
+            self.unet.train()
+        if vit_was_training:
+            self.vit.train()
+
         self.unet_optimizer.zero_grad()
         unet_student_logits = self.unet(unet_images)
         unet_consistency_loss = self.consistency_loss(unet_student_logits, vit_labels, vit_valid)
@@ -466,7 +507,7 @@ class CrossTeachingTrainer:
             "unet_confident_image_ratio": unet_valid.mean().item(),
         }
 
-    def train_epoch(self, labeled_loader, unlabeled_loader):
+    def train_epoch(self, labeled_loader, unlabeled_loader, epoch_idx):
         self.unet.train()
         self.vit.train()
 
@@ -499,7 +540,15 @@ class CrossTeachingTrainer:
                 unlabeled_iter = iter(unlabeled_loader)
                 images_u = next(unlabeled_iter)
 
-            unlabeled_stats = self.train_unlabeled_step(images_u)
+            if epoch_idx >= config.consistency_warmup_epochs:
+                unlabeled_stats = self.train_unlabeled_step(images_u)
+            else:
+                unlabeled_stats = {
+                    "unet_consistency_loss": 0.0,
+                    "vit_consistency_loss": 0.0,
+                    "vit_confident_image_ratio": 0.0,
+                    "unet_confident_image_ratio": 0.0,
+                }
 
             for key, value in {**labeled_stats, **unlabeled_stats}.items():
                 totals[key] += value
@@ -529,8 +578,28 @@ def main():
     best_val_dice = -1.0
     history = []
 
+    def save_progress(test_metrics=None):
+        payload = {
+            "model": "Cross-Teaching U-Net + ViT",
+            "setting": "semi-supervised",
+            "labeled_fraction": config.labeled_fraction,
+            "unlabeled_fraction": unlabeled_fraction,
+            "confidence_threshold": config.confidence_threshold,
+            "consistency_weight": config.consistency_weight,
+            "consistency_warmup_epochs": config.consistency_warmup_epochs,
+            "initialized_from_supervised_baselines": {
+                "unet": trainer.loaded_unet_baseline,
+                "vit": trainer.loaded_vit_baseline,
+            },
+            "best_val_ensemble_dice": best_val_dice,
+            "history": history,
+        }
+        if test_metrics is not None:
+            payload["test_metrics"] = test_metrics
+        save_json(METRICS_SAVE_PATH, payload)
+
     for epoch in range(config.epochs):
-        train_stats = trainer.train_epoch(labeled_loader, unlabeled_loader)
+        train_stats = trainer.train_epoch(labeled_loader, unlabeled_loader, epoch)
 
         unet_val_metrics = evaluate_unet(
             trainer.unet,
@@ -599,6 +668,8 @@ def main():
                 VIT_SAVE_PATH,
             )
 
+        save_progress()
+
     unet_checkpoint = torch.load(UNET_SAVE_PATH, map_location=config.device)
     vit_checkpoint = torch.load(VIT_SAVE_PATH, map_location=config.device)
 
@@ -626,23 +697,12 @@ def main():
         config.device,
     )
 
-    save_json(
-        METRICS_SAVE_PATH,
-        {
-            "model": "Cross-Teaching U-Net + ViT",
-            "setting": "semi-supervised",
-            "labeled_fraction": config.labeled_fraction,
-            "unlabeled_fraction": unlabeled_fraction,
-            "confidence_threshold": config.confidence_threshold,
-            "consistency_weight": config.consistency_weight,
-            "best_val_ensemble_dice": best_val_dice,
-            "history": history,
-            "test_metrics": {
-                "unet": unet_test_metrics,
-                "vit": vit_test_metrics,
-                "ensemble": ensemble_test_metrics,
-            },
-        },
+    save_progress(
+        test_metrics={
+            "unet": unet_test_metrics,
+            "vit": vit_test_metrics,
+            "ensemble": ensemble_test_metrics,
+        }
     )
 
     print(f"Saved best U-Net cross-teaching model to {UNET_SAVE_PATH}")
