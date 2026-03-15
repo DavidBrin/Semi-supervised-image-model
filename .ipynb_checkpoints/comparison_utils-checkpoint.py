@@ -143,29 +143,19 @@ class EnsembleInference:
     def predict_logits(self, images):
         images = images.to(self.device)
 
-        unet_in = F.interpolate(
-            images,
-            size=(self.unet_size, self.unet_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        vit_in = F.interpolate(
-            images,
-            size=(self.vit_size, self.vit_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        # Resize inputs for each model's specific requirements
+        unet_in = F.interpolate(images, size=(self.unet_size, self.unet_size), 
+                                mode="bilinear", align_corners=False)
+        vit_in = F.interpolate(images, size=(self.vit_size, self.vit_size), 
+                               mode="bilinear", align_corners=False)
 
         unet_logits = self.unet(unet_in)
         vit_logits = self.vit(vit_in)
 
-        vit_logits = F.interpolate(
-            vit_logits,
-            size=(self.unet_size, self.unet_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        # Bring ViT logits back to U-Net resolution (512) for averaging
+        # We do this in logit-space to keep the "soft" probability info
+        vit_logits = F.interpolate(vit_logits, size=(self.unet_size, self.unet_size), 
+                                   mode="bilinear", align_corners=False)
 
         return (unet_logits + vit_logits) / 2.0
 
@@ -173,6 +163,11 @@ class EnsembleInference:
     def predict_mask(self, images):
         logits = self.predict_logits(images)
         return logits.argmax(dim=1)
+
+    # ADD THIS ALIAS
+    def predict(self, images):
+        """Helper to match your notebook calling convention"""
+        return self.predict_mask(images)
 
 
 @torch.no_grad()
@@ -307,11 +302,66 @@ def evaluate_models(dataset, unet, vit, ensemble, device="cpu"):
             metrics[name]["dice"].append(dice_score_macro(pred_np, target))
             metrics[name]["iou"].append(iou_score_macro(pred_np, target))
             metrics[name]["pixel_accuracy"].append(pixel_accuracy(pred_np, target))
+        print(f"Scoring...\n")
 
     # ... (rest of your summary logic remains the same)
     summary = {name: {k: float(np.mean(v)) for k, v in m.items()} for name, m in metrics.items()}
     return metrics, summary
+from tqdm import tqdm
+import torch.nn.functional as F
 
+@torch.inference_mode() # Faster than no_grad for evaluation
+def evaluate_models_fast(dataloader, unet, vit, ensemble, device="cpu"):
+    unet.eval()
+    vit.eval()
+
+    metrics = {
+        "U-Net": {"dice": [], "iou": [], "pixel_accuracy": []},
+        "ViT": {"dice": [], "iou": [], "pixel_accuracy": []},
+        "Ensemble": {"dice": [], "iou": [], "pixel_accuracy": []},
+    }
+
+    # Progress bar for your 512 images
+    pbar = tqdm(dataloader, desc="Evaluating Test Set")
+
+    for images, masks in pbar:
+        # Move to device (CPU in this case)
+        images = images.to(device)
+        target_h, target_w = masks.shape[-2:]
+        target_np = masks.numpy() # (Batch, H, W)
+
+        # 1. Batch Inference
+        pred_unet_t = predict_unet(unet, images, device=device)
+        pred_vit_t = predict_vit(vit, images, device=device)
+        pred_ens_t = ensemble.predict_mask(images)
+
+        preds_dict = {"U-Net": pred_unet_t, "ViT": pred_vit_t, "Ensemble": pred_ens_t}
+
+        for name, pred_tensor in preds_dict.items():
+            # 2. Vectorized Batch Resizing
+            # F.interpolate expects (B, C, H, W)
+            if pred_tensor.shape[-2:] != (target_h, target_w):
+                if pred_tensor.ndim == 3: # (B, H, W) -> (B, 1, H, W)
+                    pred_tensor = pred_tensor.unsqueeze(1)
+                
+                pred_tensor = F.interpolate(
+                    pred_tensor.float(), 
+                    size=(target_h, target_w), 
+                    mode='nearest'
+                ).squeeze(1) # Back to (B, H, W)
+
+            # 3. Batch Metrics Calculation
+            # Convert whole batch to numpy at once
+            batch_preds = pred_tensor.detach().cpu().numpy().astype(np.int64)
+            
+            # Since your metric functions likely handle 1 image at a time:
+            for b in range(batch_preds.shape[0]):
+                metrics[name]["dice"].append(dice_score_macro(batch_preds[b], target_np[b]))
+                metrics[name]["iou"].append(iou_score_macro(batch_preds[b], target_np[b]))
+                metrics[name]["pixel_accuracy"].append(pixel_accuracy(batch_preds[b], target_np[b]))
+
+    summary = {name: {k: float(np.mean(v)) for k, v in m.items()} for name, m in metrics.items()}
+    return metrics, summary
 def load_metrics_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -373,32 +423,42 @@ def show_image_and_mask(image, mask, title=""):
 
 
 def compare_predictions(image, mask, unet_pred, vit_pred, ensemble_pred, title=""):
-    image = image.detach().cpu().numpy()
-    image = np.transpose(image, (1, 2, 0))
-    mask = mask.detach().cpu().numpy()
+    # 1. Convert to numpy and remove batch dimension
+    # Using [0] or .squeeze() ensures we are looking at (C, H, W) or (H, W)
+    image = image.detach().cpu().numpy().squeeze() 
+    mask = mask.detach().cpu().numpy().squeeze()
+    
+    # 2. Handle Transpose for RGB vs Grayscale
+    if image.ndim == 3:
+        # If (C, H, W), move Channel to the end for plt.imshow -> (H, W, C)
+        image = np.transpose(image, (1, 2, 0))
+    # If image.ndim == 2, it's grayscale (H, W), so no transpose needed!
 
+    # 3. Clean up predictions
     unet_pred = unet_pred.detach().cpu().numpy().squeeze()
     vit_pred = vit_pred.detach().cpu().numpy().squeeze()
     ensemble_pred = ensemble_pred.detach().cpu().numpy().squeeze()
 
-    plt.figure(figsize=(16, 4))
+    plt.figure(figsize=(18, 5))
     if title:
         plt.suptitle(title)
 
     items = [
-        (image, "Image"),
+        (image, "Input Image"),
         (mask, "Ground Truth"),
-        (unet_pred, "U-Net"),
-        (vit_pred, "ViT"),
+        (unet_pred, f"U-Net ({unet_pred.shape[0]}x{unet_pred.shape[1]})"),
+        (vit_pred, f"ViT ({vit_pred.shape[0]}x{vit_pred.shape[1]})"),
         (ensemble_pred, "Ensemble"),
     ]
 
     for i, (arr, name) in enumerate(items):
         plt.subplot(1, 5, i + 1)
-
+        
         if i == 0:
-            plt.imshow(arr)
+            # Display image (handles RGB or Grayscale automatically)
+            plt.imshow(arr) 
         else:
+            # Display masks with a discrete color map
             plt.imshow(arr, cmap="tab10", vmin=0, vmax=NUM_CLASSES - 1)
 
         plt.title(name)
