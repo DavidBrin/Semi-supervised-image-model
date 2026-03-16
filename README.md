@@ -6,7 +6,7 @@ To see the project demo, open the Segmentation_Models_Comparison Python notebook
 
 **Video link**: https://drive.google.com/file/d/1e9J-EHmM83fnVPn_2LqFt0pusYSNdr9d/view?usp=sharing  
 
-**Report**: 
+**Report**: Semi_Supervised_Segmentation.pdf
   &nbsp;
   &nbsp;
   
