@@ -9,11 +9,8 @@ To see the project demo, open the Segmentation_Models_Comparison Python notebook
 **Report**: Semi_Supervised_Segmentation.pdf
   &nbsp;
   &nbsp;
-  
-
-
-Experiments with cross-teaching learning models in segmentation and object detection
-https://www.robots.ox.ac.uk/~vgg/publications/2012/parkhi12a/parkhi12a.pdf  
+  &nbsp;
+ &nbsp;
 
 ### Analysis
 The cross-teaching method did seem to fine-tune the models to work better in an ensemble solution, but with the baseline being so high from the U-Net, we can’t say that it is definitely better at the segmentation task than a classic U-Net. However, classic supervised learning falls short when there are no human labelers for images. Since the cross-teaching method handles unlabeled images, it is more suited for larger, mostly unlabeled datasets that a U-Net simply could not train on. To further test this idea, we would need a larger, more robust dataset for segmentation and hopefully more compute power to train because our current resources already struggled to download and process the Oxford Pet dataset that we used. Data processing and compute bottlenecks aside, we used standards for segmentation models like standard learning rate, standard batching, and training set ratios. We also used the most common and recommended image resolution for ViT, 224 pixels in length with 16 pixel patches, but the decoder might need to use more context for upsampling and refinement; nonetheless, the ViT method had decent scores, with it being mostly right about pixels and still providing some useful information for ensemble inference as the ensemble model did better than the individual models. 
@@ -25,6 +22,12 @@ Detection decoder heads: If you looked through the GitHub repository, you may ha
 
 
 Proposal Doc link: https://docs.google.com/document/d/1GdPYVw6jWP_IWDQxzebe5XPHJY_rweNvyGf-1dSAd8s/edit?usp=sharing  
+
+References (in case you didn't read the report): 
+https://ieeexplore.ieee.org/document/10024903 
+https://arxiv.org/abs/2010.11929v2  
+https://arxiv.org/pdf/2207.14191v2
+[https://www.robots.ox.ac.uk/~vgg/publications/2012/parkhi12a](https://www.robots.ox.ac.uk/~vgg/publications/2012/parkhi12a/parkhi12a.pdf  )
    
 Thank you for reading and looking through out project!    
 
